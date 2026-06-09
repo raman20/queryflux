@@ -19,7 +19,7 @@ endif
 TPCH_SCALE ?= tiny
 export TPCH_SCALE
 
-.PHONY: dev stop logs build lint clippy check test benchmark benchmark-build benchmark-run test-e2e clean setup
+.PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run test-e2e clean setup
 
 ## Create virtualenv and install Python dependencies (sqlglot etc.)
 setup:
@@ -60,6 +60,10 @@ build:
 lint: clippy
 clippy:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
+
+## Validate the Helm chart structure and run helm lint/template.
+helm-check:
+	scripts/check-helm-chart.sh
 
 ## Run unit/integration tests (no external services needed).
 ## Same command as CI `.github/workflows/ci.yml` (`make test`).
