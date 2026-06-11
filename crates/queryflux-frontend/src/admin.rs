@@ -30,7 +30,7 @@ use queryflux_persistence::{
         QueryFilters, QuerySummary,
     },
     routing_json::{enrich_routers_for_api, resolve_routers_for_storage},
-    script_library::{UpsertUserScript, UserScriptRecord},
+    script_library::{UpsertUserScript, UserScriptRecord, KIND_GUARD},
     AdminStore,
 };
 use serde::{Deserialize, Serialize};
@@ -1916,9 +1916,127 @@ async fn get_guardrails_config_handler(State(state): State<Arc<AdminState>>) -> 
 #[allow(dead_code)]
 struct GuardrailsConfigDto {
     #[serde(default)]
-    global: Vec<serde_json::Value>,
+    global: Vec<GuardSpecDto>,
     #[serde(default)]
-    groups: HashMap<String, Vec<serde_json::Value>>,
+    groups: HashMap<String, Vec<GuardSpecDto>>,
+}
+
+impl GuardrailsConfigDto {
+    fn validate(&self) -> std::result::Result<(), String> {
+        for (idx, spec) in self.global.iter().enumerate() {
+            spec.validate().map_err(|e| format!("global[{idx}]: {e}"))?;
+        }
+        for (group, specs) in &self.groups {
+            for (idx, spec) in specs.iter().enumerate() {
+                spec.validate()
+                    .map_err(|e| format!("groups.{group}[{idx}]: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn referenced_script_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .global
+            .iter()
+            .chain(self.groups.values().flatten())
+            .filter_map(GuardSpecDto::script_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebhookFailBehavior {
+    Deny,
+    Allow,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[allow(dead_code)]
+enum GuardSpecDto {
+    BuiltIn {
+        name: Option<String>,
+        #[serde(default)]
+        max_rows: Option<u64>,
+        #[serde(default)]
+        applies_to: Option<Vec<String>>,
+    },
+    PythonScript {
+        script_id: Option<i64>,
+        #[serde(default)]
+        script: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    HttpWebhook {
+        url: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        retry_count: Option<u32>,
+        #[serde(default)]
+        fail_behavior: Option<WebhookFailBehavior>,
+        #[serde(default)]
+        headers: Option<HashMap<String, String>>,
+    },
+}
+
+impl GuardSpecDto {
+    fn validate(&self) -> std::result::Result<(), String> {
+        match self {
+            GuardSpecDto::BuiltIn { name, .. } => match name.as_deref() {
+                Some("read_only" | "row_limit" | "require_predicate") => Ok(()),
+                Some(other) => Err(format!("unsupported built_in guard name \"{other}\"")),
+                None => Err("built_in guard is missing required field \"name\"".to_string()),
+            },
+            GuardSpecDto::PythonScript {
+                script_id, script, ..
+            } => {
+                let has_script = script.as_ref().is_some_and(|s| !s.trim().is_empty());
+                let has_id = script_id.is_some();
+                if has_script && has_id {
+                    return Err(
+                        "python_script guard must set either \"script\" or \"script_id\", not both"
+                            .to_string(),
+                    );
+                }
+                if !has_script && !has_id {
+                    return Err(
+                        "python_script guard requires either \"script\" or \"script_id\""
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            GuardSpecDto::HttpWebhook { url, .. } => {
+                let raw = url.as_deref().unwrap_or_default().trim();
+                if raw.is_empty() {
+                    return Err("http_webhook guard is missing required field \"url\"".to_string());
+                }
+                match url::Url::parse(raw) {
+                    Ok(parsed) => match parsed.scheme() {
+                        "http" | "https" => Ok(()),
+                        other => Err(format!(
+                            "http_webhook url must use http or https scheme, got \"{other}\""
+                        )),
+                    },
+                    Err(e) => Err(format!("http_webhook url is not a valid URL: {e}")),
+                }
+            }
+        }
+    }
+
+    fn script_id(&self) -> Option<i64> {
+        match self {
+            GuardSpecDto::PythonScript { script_id, .. } => *script_id,
+            _ => None,
+        }
+    }
 }
 
 /// Replace the guardrails configuration.
@@ -1944,12 +2062,45 @@ async fn put_guardrails_config_handler(
         )
             .into_response();
     };
-    if let Err(e) = serde_json::from_value::<GuardrailsConfigDto>(body.clone()) {
+    let dto = match serde_json::from_value::<GuardrailsConfigDto>(body.clone()) {
+        Ok(dto) => dto,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid guardrails config: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = dto.validate() {
         return (
             StatusCode::BAD_REQUEST,
             format!("invalid guardrails config: {e}"),
         )
             .into_response();
+    }
+    for script_id in dto.referenced_script_ids() {
+        match store.get_user_script(script_id).await {
+            Ok(Some(script)) if script.kind == KIND_GUARD => {}
+            Ok(Some(script)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "invalid guardrails config: python_script guard references script id {script_id} with kind \"{}\", expected \"guard\"",
+                        script.kind
+                    ),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    script_id,
+                    "python_script guard references missing script id; \
+                     saving config but guard will DENY all queries at runtime via MisconfiguredGuard"
+                );
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
     }
     match store.set_proxy_setting("guardrails_config", body).await {
         Ok(()) => {
@@ -1957,5 +2108,107 @@ async fn put_guardrails_config_handler(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuardrailsConfigDto;
+    use serde_json::json;
+
+    #[test]
+    fn guardrails_dto_allows_supported_built_in_guards() {
+        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [
+                { "kind": "built_in", "name": "read_only" },
+                { "kind": "built_in", "name": "row_limit", "max_rows": 1000 }
+            ],
+            "groups": {
+                "analytics": [
+                    { "kind": "built_in", "name": "require_predicate", "applies_to": ["fct_*"] }
+                ]
+            }
+        }))
+        .expect("valid dto");
+
+        dto.validate().expect("supported built-ins should validate");
+    }
+
+    #[test]
+    fn guardrails_dto_allows_external_guard_kinds() {
+        let python: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script", "script_id": 42, "timeout_ms": 250 }]
+        }))
+        .expect("shape should parse");
+        python
+            .validate()
+            .expect("python script guard should validate");
+
+        let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook", "url": "https://policy.example/guard" }]
+        }))
+        .expect("shape should parse");
+        webhook
+            .validate()
+            .expect("http webhook guard should validate");
+    }
+
+    #[test]
+    fn guardrails_dto_requires_external_guard_fields() {
+        let python: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script" }]
+        }))
+        .expect("shape should parse");
+        assert!(python.validate().unwrap_err().contains("script_id"));
+
+        let webhook: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook" }]
+        }))
+        .expect("shape should parse");
+        assert!(webhook.validate().unwrap_err().contains("url"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_blank_inline_script() {
+        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script", "script": "  " }]
+        }))
+        .expect("shape should parse");
+        assert!(dto.validate().unwrap_err().contains("script"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_both_script_and_id() {
+        let dto: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "python_script", "script_id": 1, "script": "def check(ctx): pass" }]
+        }))
+        .expect("shape should parse");
+        assert!(dto.validate().unwrap_err().contains("not both"));
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_invalid_fail_behavior() {
+        let result = serde_json::from_value::<GuardrailsConfigDto>(json!({
+            "global": [{ "kind": "http_webhook", "url": "https://x.co/g", "fail_behavior": "typo" }]
+        }));
+        assert!(
+            result.is_err(),
+            "typo in fail_behavior should be rejected by serde"
+        );
+    }
+
+    #[test]
+    fn guardrails_dto_rejects_non_http_url_scheme() {
+        let file_url: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook", "url": "file:///etc/passwd" }]
+        }))
+        .expect("shape should parse");
+        assert!(file_url.validate().unwrap_err().contains("http or https"));
+
+        let ftp_url: GuardrailsConfigDto = serde_json::from_value(json!({
+            "global": [{ "kind": "http_webhook", "url": "ftp://evil.example" }]
+        }))
+        .expect("shape should parse");
+        assert!(ftp_url.validate().unwrap_err().contains("http or https"));
     }
 }

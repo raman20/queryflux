@@ -28,7 +28,9 @@ export interface GuardRow {
   timeoutMs: string;
   scriptId: string; // python_script: numeric script id stored as string, "" when unset
   scriptName: string; // python_script: display name resolved at load time
+  inlineScript: string; // python_script: inline script body, "" when unset
   failBehavior: "deny" | "allow"; // http_webhook: behavior on unreachable
+  retryCount: string; // http_webhook: retries after the first failed attempt
   headers: Array<{ key: string; value: string }>; // http_webhook: extra request headers
 }
 
@@ -51,7 +53,9 @@ export function dtoToRow(dto: GuardSpecDto, scripts?: UserScriptRecord[]): Guard
     timeoutMs: dto.timeout_ms != null ? String(dto.timeout_ms) : "",
     scriptId,
     scriptName,
+    inlineScript: dto.script ?? "",
     failBehavior: dto.fail_behavior === "allow" ? "allow" : "deny",
+    retryCount: dto.retry_count != null ? String(dto.retry_count) : "",
     headers: dto.headers
       ? Object.entries(dto.headers).map(([key, value]) => ({ key, value }))
       : [],
@@ -65,6 +69,7 @@ export function rowToDto(row: GuardRow): GuardSpecDto {
       kind: "http_webhook",
       url: row.url,
       timeout_ms: row.timeoutMs.trim() ? Number(row.timeoutMs) : null,
+      retry_count: row.retryCount.trim() ? Number(row.retryCount) : null,
       fail_behavior: row.failBehavior,
       headers: validHeaders.length > 0
         ? Object.fromEntries(validHeaders.map((h) => [h.key.trim(), h.value]))
@@ -72,11 +77,16 @@ export function rowToDto(row: GuardRow): GuardSpecDto {
     };
   }
   if (row.kind === "python_script") {
-    return {
+    const dto: GuardSpecDto = {
       kind: "python_script",
-      script_id: row.scriptId ? Number(row.scriptId) : undefined,
       timeout_ms: row.timeoutMs.trim() ? Number(row.timeoutMs) : null,
     };
+    if (row.scriptId) {
+      dto.script_id = Number(row.scriptId);
+    } else if (row.inlineScript.trim()) {
+      dto.script = row.inlineScript;
+    }
+    return dto;
   }
   const dto: GuardSpecDto = { kind: "built_in", name: row.name };
   if (row.name === "row_limit" && row.maxRows.trim()) {
@@ -193,7 +203,9 @@ function blankGuardRow(kind: GuardRow["kind"], name = "read_only"): GuardRow {
     timeoutMs: "",
     scriptId: "",
     scriptName: "",
+    inlineScript: "",
     failBehavior: "deny",
+    retryCount: "",
     headers: [],
   };
 }
@@ -216,7 +228,7 @@ export function AddGuardForm({
     form.kind === "http_webhook"
       ? form.url.trim() !== ""
       : form.kind === "python_script"
-      ? form.scriptId.trim() !== ""
+      ? form.scriptId.trim() !== "" || form.inlineScript.trim() !== ""
       : form.name !== "";
 
   return (
@@ -359,6 +371,19 @@ export function AddGuardForm({
                   placeholder="500"
                   value={form.timeoutMs}
                   onChange={(e) => setForm((f) => ({ ...f, timeoutMs: e.target.value }))}
+                />
+              </div>
+              <div className="w-20">
+                <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-widest mb-1">
+                  Retries
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  className={`w-full ${inputCls}`}
+                  placeholder="0"
+                  value={form.retryCount}
+                  onChange={(e) => setForm((f) => ({ ...f, retryCount: e.target.value }))}
                 />
               </div>
               <div className="flex-1">

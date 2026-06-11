@@ -30,11 +30,22 @@ impl ConfigProvider for YamlFileConfigProvider {
             ))
         })?;
 
-        serde_yaml::from_str(&content).map_err(|e| {
+        let config: ProxyConfig = serde_yaml::from_str(&content).map_err(|e| {
             QueryFluxError::Config(format!(
                 "Failed to parse config file {}: {e}",
                 self.path.display()
             ))
-        })
+        })?;
+
+        if let Some(guardrails) = &config.guardrails {
+            if let Err(e) = guardrails.validate() {
+                tracing::warn!(
+                    "Invalid guardrails in {}: {e} — will be ignored if Postgres config overrides YAML",
+                    self.path.display()
+                );
+            }
+        }
+
+        Ok(config)
     }
 }
